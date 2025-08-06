@@ -1,6 +1,9 @@
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder, get, post,
-    http::StatusCode, middleware::Logger, web::{self, Bytes},
+    App, HttpRequest, HttpResponse, HttpServer, Responder, get,
+    http::StatusCode,
+    middleware::Logger,
+    post,
+    web::{self, Bytes},
 };
 use async_stream::stream;
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
@@ -103,12 +106,13 @@ struct ChatRequest {
     include_reasoning: Option<bool>,
 }
 
+#[derive(Clone)]
 struct AppState {
     client: Client,
     db_pool: Option<Pool>,
 }
 
-fn get_models() -> Vec<String> {
+fn get_available_models() -> Vec<String> {
     std::env::var("COMPLETION_MODELS")
         .or_else(|_| std::env::var("COMPLETIONS_MODEL"))
         .unwrap_or_else(|_| "unknown".to_string())
@@ -118,7 +122,13 @@ fn get_models() -> Vec<String> {
         .collect()
 }
 
-fn log_request(pool: Pool, req: ChatRequest, res: Value, ip: std::net::IpAddr, user_agent: Option<String>) {
+fn log_request(
+    pool: Pool,
+    req: ChatRequest,
+    res: Value,
+    ip: std::net::IpAddr,
+    user_agent: Option<String>,
+) {
     tokio::spawn(async move {
         if let Ok(conn) = pool.get().await {
             let req_json = serde_json::to_string(&req).unwrap_or_default();
@@ -134,22 +144,24 @@ fn log_request(pool: Pool, req: ChatRequest, res: Value, ip: std::net::IpAddr, u
 #[get("/")]
 async fn index(data: web::Data<AppState>) -> Result<impl Responder, Box<dyn std::error::Error>> {
     let sum: i32 = if let Some(pool) = &data.db_pool {
-        pool.get().await.ok()
-            .and_then(|conn| tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    conn.query_one("SELECT SUM((response->'usage'->>'total_tokens')::real) FROM api_request_logs;", &[]).await.ok()
-                })
-            }))
-            .and_then(|row| row.get::<_, Option<f32>>("sum"))
-            .map(|val| val as i32)
-            .unwrap_or(-1)
-    } else { -1 };
+        match pool.get().await {
+            Ok(conn) => {
+                match conn.query_one("SELECT SUM((response->'usage'->>'total_tokens')::real) FROM api_request_logs;", &[]).await {
+                    Ok(row) => row.get::<_, Option<f32>>("sum").map(|val| val as i32).unwrap_or(0),
+                    Err(_) => -1
+                }
+            }
+            Err(_) => -1,
+        }
+    } else {
+        -1
+    };
 
     let mut env = Environment::new();
     env.set_loader(path_loader("templates"));
     let tmpl = env.get_template("index.jinja")?;
-    let models = get_models();
-    let ctx = context!(total_tokens => sum, models => models);
+    let available_models = get_available_models();
+    let ctx = context!(total_tokens => sum, models => available_models);
     let page = tmpl.render(ctx)?;
 
     Ok(HttpResponse::Ok().content_type("text/html").body(page))
@@ -161,30 +173,42 @@ async fn completions(
     mut body: web::Json<ChatRequest>,
     req: HttpRequest,
 ) -> Result<impl Responder, Box<dyn std::error::Error>> {
-    let models = get_models();
+    let available_models = get_available_models();
     body.model = Some(
-        body.model.as_ref()
-            .filter(|m| models.contains(m))
+        body.model
+            .as_ref()
+            .filter(|m| available_models.contains(m))
             .cloned()
-            .or_else(|| models.first().cloned())
-            .unwrap_or_else(|| "unknown".to_string())
+            .or_else(|| available_models.first().cloned())
+            .unwrap_or_else(|| "unknown".to_string()),
     );
 
-    let res = data.client
+    let res = data
+        .client
         .post(std::env::var("COMPLETIONS_URL")?)
         .json(&body.into_inner())
         .send()
         .await?;
 
     if !res.status().is_success() {
-        let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        return Ok(HttpResponse::build(status).content_type("application/json").body(res.text().await?));
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        return Ok(HttpResponse::build(status)
+            .content_type("application/json")
+            .body(res.text().await?));
     }
 
     let is_stream = body.stream == Some(true);
     let log_body = body.clone();
-    let ip = req.peer_addr().map(|a| a.ip()).unwrap_or_else(|| "0.0.0.0".parse().unwrap());
-    let user_agent = req.headers().get("user-agent").and_then(|v| v.to_str().ok()).map(String::from);
+    let ip = req
+        .peer_addr()
+        .map(|a| a.ip())
+        .unwrap_or_else(|| "0.0.0.0".parse().unwrap());
+    let user_agent = req
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
     if is_stream {
         let mut stream_res = res.bytes_stream();
@@ -203,12 +227,9 @@ async fn completions(
                         let json_str = line.strip_prefix("data: ").unwrap_or(line);
                         if json_str == "[DONE]" { break; }
 
-                        if let Ok(mut val) = serde_json::from_str::<Value>(json_str) {
+                        if let Ok(val) = serde_json::from_str::<Value>(json_str) {
                             if let Some(ref pool) = pool {
                                 log_request(pool.clone(), log_body.clone(), val.clone(), ip, user_agent.clone());
-                            }
-                            if let Value::Object(ref mut map) = val {
-                                map.remove("usage");
                             }
                             if let Ok(mut bytes) = serde_json::to_vec(&val) {
                                 bytes.extend(b"\n");
@@ -220,31 +241,41 @@ async fn completions(
             }
         };
 
-        Ok(HttpResponse::Ok().content_type("application/x-ndjson").streaming(Box::pin(processed_stream)))
+        Ok(HttpResponse::Ok()
+            .content_type("application/x-ndjson")
+            .streaming(Box::pin(processed_stream)))
     } else {
-        let mut res_json = res.json::<Value>().await?;
+        let res_json = res.json::<Value>().await?;
         if let Some(ref pool) = data.db_pool {
             log_request(pool.clone(), log_body, res_json.clone(), ip, user_agent);
         }
-        if let Value::Object(ref mut map) = res_json {
-            map.remove("usage");
-        }
-        Ok(HttpResponse::Ok().content_type("application/json").json(res_json))
+        Ok(HttpResponse::Ok()
+            .content_type("application/json")
+            .json(res_json))
     }
 }
 
 #[get("/models")]
-async fn models() -> Result<impl Responder, Box<dyn std::error::Error>> {
-    let models = get_models().into_iter()
-        .map(|id| ModelObject { id, object: "model".to_string(), created: 1640995200, owned_by: "system".to_string() })
+async fn get_models() -> Result<impl Responder, Box<dyn std::error::Error>> {
+    let available_models = get_available_models()
+        .into_iter()
+        .map(|id| ModelObject {
+            id,
+            object: "model".to_string(),
+            created: 1640995200,
+            owned_by: "system".to_string(),
+        })
         .collect();
-    
-    Ok(HttpResponse::Ok().json(ModelsResponse { object: "list".to_string(), data: models }))
+
+    Ok(HttpResponse::Ok().json(ModelsResponse {
+        object: "list".to_string(),
+        data: available_models,
+    }))
 }
 
 #[get("/model")]
-async fn model() -> impl Responder {
-    HttpResponse::Ok().body(get_models().join(","))
+async fn get_model() -> impl Responder {
+    HttpResponse::Ok().body(get_available_models().join(","))
 }
 
 #[get("/echo")]
@@ -261,33 +292,64 @@ async fn hey() -> impl Responder {
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
-    let db_pool = std::env::var("DB_URL").ok().and_then(|url| {
+    let db_pool = if let Ok(url) = std::env::var("DB_URL") {
         let mut cfg = Config::new();
         cfg.url = Some(url);
-        cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
-        cfg.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls).ok()
-    }).and_then(|pool| {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                if let Ok(conn) = pool.get().await {
-                    conn.batch_execute(
-                        "CREATE TABLE IF NOT EXISTS api_request_logs (
-                            id SERIAL PRIMARY KEY,
-                            request JSONB NOT NULL,
-                            response JSONB NOT NULL,
-                            ip INET NOT NULL,
-                            user_agent VARCHAR(512),
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-                        );"
-                    ).await.ok().map(|_| pool)
-                } else { None }
-            })
-        })
-    });
+        cfg.manager = Some(ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        });
+
+        match cfg.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls) {
+            Ok(pool) => {
+                log::info!("Database pool created. Checking for table...");
+                match pool.get().await {
+                    Ok(conn) => {
+                        let creation_result = conn
+                            .batch_execute(
+                                "CREATE TABLE IF NOT EXISTS api_request_logs (
+                                id SERIAL PRIMARY KEY,
+                                request JSONB NOT NULL,
+                                response JSONB NOT NULL,
+                                ip INET NOT NULL,
+                                user_agent VARCHAR(512),
+                                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            );",
+                            )
+                            .await;
+
+                        match creation_result {
+                            Ok(_) => {
+                                log::info!("Database table 'api_request_logs' is ready.");
+                                Some(pool)
+                            }
+                            Err(e) => {
+                                log::error!("Failed to create database table: {}", e);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to get connection from pool: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to create database pool: {}", e);
+                None
+            }
+        }
+    } else {
+        log::warn!("DB_URL not set. Database logging is disabled.");
+        None
+    };
 
     let api_key = std::env::var("KEY").expect("KEY environment variable must be set");
     let mut headers = header::HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
     headers.insert(header::AUTHORIZATION, {
         let mut token = header::HeaderValue::from_str(&format!("Bearer {}", api_key)).unwrap();
         token.set_sensitive(true);
@@ -299,12 +361,17 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            .wrap(actix_cors::Cors::default().allow_any_origin().allow_any_method().allow_any_header())
+            .wrap(
+                actix_cors::Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header(),
+            )
             .app_data(web::Data::new(app_state.clone()))
             .service(index)
             .service(completions)
-            .service(models)
-            .service(model)
+            .service(get_models)
+            .service(get_model)
             .service(echo)
             .service(hey)
             .wrap(Logger::default())
