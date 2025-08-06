@@ -1,15 +1,16 @@
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder, get,
+    get,
     http::StatusCode,
     middleware::Logger,
     post,
     web::{self, Bytes},
+    App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use async_stream::stream;
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use futures::StreamExt;
-use minijinja::{Environment, context, path_loader};
-use reqwest::{Client, header};
+use minijinja::{context, path_loader, Environment};
+use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -183,6 +184,18 @@ async fn completions(
             .unwrap_or_else(|| "unknown".to_string()),
     );
 
+    let is_stream = body.stream == Some(true);
+    let log_body = body.clone();
+    let ip = req
+        .peer_addr()
+        .map(|a| a.ip())
+        .unwrap_or_else(|| "0.0.0.0".parse().unwrap());
+    let user_agent = req
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
     let res = data
         .client
         .post(std::env::var("COMPLETIONS_URL")?)
@@ -198,18 +211,6 @@ async fn completions(
             .body(res.text().await?));
     }
 
-    let is_stream = body.stream == Some(true);
-    let log_body = body.clone();
-    let ip = req
-        .peer_addr()
-        .map(|a| a.ip())
-        .unwrap_or_else(|| "0.0.0.0".parse().unwrap());
-    let user_agent = req
-        .headers()
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-
     if is_stream {
         let mut stream_res = res.bytes_stream();
         let pool = data.db_pool.clone();
@@ -220,11 +221,11 @@ async fn completions(
                 if let Ok(bytes) = chunk {
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
                     while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..pos].trim();
+                        let line = buffer[..pos].trim().to_string();
                         buffer = buffer[pos + 1..].to_string();
 
                         if line.is_empty() { continue; }
-                        let json_str = line.strip_prefix("data: ").unwrap_or(line);
+                        let json_str = line.strip_prefix("data: ").unwrap_or(&line);
                         if json_str == "[DONE]" { break; }
 
                         if let Ok(val) = serde_json::from_str::<Value>(json_str) {
@@ -323,19 +324,19 @@ async fn main() -> std::io::Result<()> {
                                 Some(pool)
                             }
                             Err(e) => {
-                                log::error!("Failed to create database table: {}", e);
+                                log::error!("Failed to create database table: {e}");
                                 None
                             }
                         }
                     }
                     Err(e) => {
-                        log::error!("Failed to get connection from pool: {}", e);
+                        log::error!("Failed to get connection from pool: {e}");
                         None
                     }
                 }
             }
             Err(e) => {
-                log::error!("Failed to create database pool: {}", e);
+                log::error!("Failed to create database pool: {e}");
                 None
             }
         }
@@ -351,7 +352,7 @@ async fn main() -> std::io::Result<()> {
         header::HeaderValue::from_static("application/json"),
     );
     headers.insert(header::AUTHORIZATION, {
-        let mut token = header::HeaderValue::from_str(&format!("Bearer {}", api_key)).unwrap();
+        let mut token = header::HeaderValue::from_str(&format!("Bearer {api_key}")).unwrap();
         token.set_sensitive(true);
         token
     });
