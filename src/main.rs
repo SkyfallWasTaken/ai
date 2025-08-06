@@ -49,10 +49,20 @@ async fn index(data: web::Data<AppState>) -> Result<impl Responder, Box<dyn std:
     env.set_loader(path_loader("templates"));
     let tmpl = env.get_template("index.jinja")?;
 
+    // Parse models from environment variable
+    let models_str = std::env::var("COMPLETION_MODELS").unwrap_or_else(|_| {
+        std::env::var("COMPLETIONS_MODEL").unwrap_or_else(|_| "unknown".to_string())
+    });
+    let models: Vec<String> = models_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let ctx = if sum >= 0 {
-        context!(total_tokens => sum, model => std::env::var("COMPLETIONS_MODEL")?)
+        context!(total_tokens => sum, models => models)
     } else {
-        context!(total_tokens => -1, model => std::env::var("COMPLETIONS_MODEL")?)
+        context!(total_tokens => -1, models => models)
     };
 
     let page = tmpl.render(ctx)?;
@@ -153,12 +163,33 @@ mod chat {
         mut body: web::Json<RequestPayload>,
         req: HttpRequest,
     ) -> Result<impl Responder, Box<dyn std::error::Error>> {
-        // As requested, ignore the model specified by the user and use the one from env vars.
-        body.model = Some(std::env::var("COMPLETIONS_MODEL").unwrap().to_string());
+        // Parse available models from environment variable
+        let models_str = std::env::var("COMPLETION_MODELS").unwrap_or_else(|_| {
+            std::env::var("COMPLETIONS_MODEL").unwrap_or_else(|_| "unknown".to_string())
+        });
+        let available_models: Vec<String> = models_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Use the requested model if it's in the available models list, otherwise use the first one
+        let selected_model = if let Some(requested_model) = &body.model {
+            if available_models.contains(requested_model) {
+                requested_model.clone()
+            } else {
+                available_models.first().cloned().unwrap_or_else(|| "unknown".to_string())
+            }
+        } else {
+            available_models.first().cloned().unwrap_or_else(|| "unknown".to_string())
+        };
+
+        body.model = Some(selected_model);
 
         // Debug log request parameters
         println!("Request parameters:");
         println!("  Model: {:?}", body.model);
+        println!("  Available models: {:?}", available_models);
         println!("  Messages count: {}", body.messages.len());
         println!("  Stream: {:?}", body.stream);
         println!("  Temperature: {:?}", body.temperature);
@@ -355,8 +386,10 @@ struct AppState {
 
 #[get("/model")]
 async fn get_model() -> Result<impl Responder, Box<dyn std::error::Error>> {
-    let model = std::env::var("COMPLETIONS_MODEL")?;
-    Ok(HttpResponse::Ok().body(model))
+    let models_str = std::env::var("COMPLETION_MODELS").unwrap_or_else(|_| {
+        std::env::var("COMPLETIONS_MODEL").unwrap_or_else(|_| "unknown".to_string())
+    });
+    Ok(HttpResponse::Ok().body(models_str))
 }
 
 #[get("/echo")]
@@ -374,6 +407,10 @@ pub async fn main() -> std::io::Result<()> {
 
     // Show environment variables status
     println!("Environment variables:");
+    println!(
+        "  COMPLETION_MODELS: {:?}",
+        std::env::var("COMPLETION_MODELS").unwrap_or_else(|_| "NOT SET".to_string())
+    );
     println!(
         "  COMPLETIONS_MODEL: {:?}",
         std::env::var("COMPLETIONS_MODEL").unwrap_or_else(|_| "NOT SET".to_string())
@@ -493,5 +530,4 @@ pub async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", 8080))?
     .run()
     .await
-        }
-        
+}
