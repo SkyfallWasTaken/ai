@@ -163,7 +163,7 @@ async fn index(data: web::Data<AppState>) -> Result<impl Responder, Box<dyn std:
     let sum: i32 = if let Some(pool) = &data.db_pool {
         match pool.get().await {
             Ok(conn) => {
-                match conn.query_one("SELECT COALESCE(SUM((response->'usage'->>'total_tokens')::INTEGER), 0) as total FROM api_request_logs WHERE response ? 'usage' AND response->'usage' ? 'total_tokens';", &[]).await {
+                match conn.query_one("SELECT COALESCE(SUM((response->'usage'->>'total_tokens')::INTEGER), 0) as total FROM api_request_logs;", &[]).await {
                     Ok(row) => row.get::<_, i32>("total"),
                     Err(_) => -1
                 }
@@ -338,7 +338,7 @@ async fn main() -> std::io::Result<()> {
                             CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_created_at ON api_request_logs(created_at);
                             CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_ip ON api_request_logs(ip);
                             CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_response_usage ON api_request_logs USING GIN ((response->'usage'));
-                            CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_total_tokens ON api_request_logs(((response->'usage'->>'total_tokens')::INTEGER)) WHERE response ? 'usage' AND response->'usage' ? 'total_tokens';
+                            CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_total_tokens ON api_request_logs(((response->'usage'->>'total_tokens')::INTEGER)) WHERE response->'usage'->>'total_tokens' IS NOT NULL;
                             CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_request_model ON api_request_logs USING GIN ((request->'model'));",
                             )
                             .await;
