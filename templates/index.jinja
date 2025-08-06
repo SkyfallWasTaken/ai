@@ -15,39 +15,42 @@
         key needed.
       </p>
       <p>
-        <b>{{ total_tokens }}</b> tokens processed since January 2025. Current
-        model:
-        <b
-          ><code>{{ model }}</code></b
-        >.
+        <b>{{ total_tokens }}</b> tokens processed since January 2025. Available
+        models:
+        {% if models|length == 1 %}
+        <b><code>{{ models[0] }}</code></b>
+        {% else %}
+        {% for model in models %}
+          <b><code>{{ model }}</code></b>{% if not loop.last %}, {% endif %}
+        {% endfor %}
+        {% endif %}
+        .
       </p>
       <p>
         Open source at
         <a href="https://github.com/hackclub/ai">github.com/hackclub/ai</a>!
       </p>
     </header>
-
     <section>
       <h2>Usage</h2>
       <h3>Chat Completions</h3>
       <pre><code>curl -X POST https://ai.hackclub.com/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
-        "messages": [{"role": "user", "content": "Tell me a joke!"}]
+        "messages": [{"role": "user", "content": "Tell me a joke!"}]{% if models|length > 1 %},
+        "model": "{{ models[0] }}"{% endif %}
     }'</code></pre>
-
-      <h3>Get Current Model</h3>
-      <p>To get current model:</p>
+      <h3>Get Available Models</h3>
+      <p>To get available models:</p>
       <pre><code>curl https://ai.hackclub.com/model</code></pre>
-      <p>Example response: <code>{{ model }}</code></p>
+      <p>Example response: <code>{{ models|join(', ') }}</code></p>
     </section>
-
     <section>
       <h2>API Parameters</h2>
       <p>The API accepts all standard OpenAI-style parameters for chat completions:</p>
       <ul>
         <li><code>messages</code> - Array of message objects with role and content</li>
-        <li><code>model</code> - (Ignored) Model is set server-side</li>
+        <li><code>model</code> - {% if models|length > 1 %}Choose from available models: {% for model in models %}<code>{{ model }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% else %}(Ignored) Model is set server-side{% endif %}</li>
         <li><code>temperature</code> - Controls randomness (0.0 to 2.0)</li>
         <li><code>max_completion_tokens</code> - Maximum number of tokens to generate</li>
         <li><code>top_p</code> - Controls diversity via nucleus sampling</li>
@@ -63,11 +66,14 @@
         <li><code>reasoning_format</code> - Format for reasoning output (reasoning models only)</li>
         <li><code>reasoning_effort</code> - Controls the reasoning effort for Qwen models (none or default)</li>
       </ul>
+      {% if models|length > 1 %}
+      <p><strong>Note:</strong> You can specify which model to use with the <code>model</code> parameter. If not specified or if an unavailable model is requested, the first available model ({{ models[0] }}) will be used.</p>
+      {% else %}
       <p><strong>Note:</strong> The <code>model</code> parameter is ignored as the model is configured server-side.</p>
+      {% endif %}
       <p><strong>Note:</strong> Reasoning parameters (<code>include_reasoning</code> and <code>reasoning_format</code>) only work when the currently set model is a reasoning model.</p>
       <p><strong>Note:</strong> The <code>reasoning_effort</code> parameter only works for Qwen models. Use "none" for fast responses without reasoning or "default" for normal reasoning effort.</p>
     </section>
-
     <section>
 	<h2>Terms</h2>
 	<p>
