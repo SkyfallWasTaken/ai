@@ -14,6 +14,7 @@ use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ModelObject {
@@ -113,14 +114,29 @@ struct AppState {
     db_pool: Option<Pool>,
 }
 
-fn get_available_models() -> Vec<String> {
-    std::env::var("COMPLETION_MODELS")
-        .or_else(|_| std::env::var("COMPLETIONS_MODEL"))
-        .unwrap_or_else(|_| "unknown".to_string())
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+use std::sync::Arc;
+
+static AVAILABLE_MODELS: OnceLock<Vec<String>> = OnceLock::new();
+static TEMPLATE_ENV: OnceLock<Arc<Environment>> = OnceLock::new();
+
+fn get_available_models() -> &'static Vec<String> {
+    AVAILABLE_MODELS.get_or_init(|| {
+        std::env::var("COMPLETION_MODELS")
+            .or_else(|_| std::env::var("COMPLETIONS_MODEL"))
+            .unwrap_or_else(|_| "unknown".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+fn get_template_env() -> &'static Arc<Environment<'static>> {
+    TEMPLATE_ENV.get_or_init(|| {
+        let mut env = Environment::new();
+        env.set_loader(path_loader("templates"));
+        Arc::new(env)
+    })
 }
 
 fn log_request(
@@ -147,8 +163,8 @@ async fn index(data: web::Data<AppState>) -> Result<impl Responder, Box<dyn std:
     let sum: i32 = if let Some(pool) = &data.db_pool {
         match pool.get().await {
             Ok(conn) => {
-                match conn.query_one("SELECT SUM((response->'usage'->>'total_tokens')::real) FROM api_request_logs;", &[]).await {
-                    Ok(row) => row.get::<_, Option<f32>>("sum").map(|val| val as i32).unwrap_or(0),
+                match conn.query_one("SELECT COALESCE(SUM((response->'usage'->>'total_tokens')::INTEGER), 0) as total FROM api_request_logs WHERE response ? 'usage' AND response->'usage' ? 'total_tokens';", &[]).await {
+                    Ok(row) => row.get::<_, i32>("total"),
                     Err(_) => -1
                 }
             }
@@ -158,8 +174,7 @@ async fn index(data: web::Data<AppState>) -> Result<impl Responder, Box<dyn std:
         -1
     };
 
-    let mut env = Environment::new();
-    env.set_loader(path_loader("templates"));
+    let env = get_template_env();
     let tmpl = env.get_template("index.jinja")?;
     let available_models = get_available_models();
     let ctx = context!(total_tokens => sum, models => available_models);
@@ -216,14 +231,15 @@ async fn completions(
         let pool = data.db_pool.clone();
 
         let processed_stream = stream! {
-            let mut buffer = String::new();
+            let mut buffer = Vec::with_capacity(8192);
             while let Some(chunk) = stream_res.next().await {
                 if let Ok(bytes) = chunk {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..pos].trim().to_string();
-                        buffer = buffer[pos + 1..].to_string();
-
+                    buffer.extend_from_slice(&bytes);
+                    
+                    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len()-1]);
+                        
                         if line.is_empty() { continue; }
                         let json_str = line.strip_prefix("data: ").unwrap_or(&line);
                         if json_str == "[DONE]" { break; }
@@ -232,9 +248,12 @@ async fn completions(
                             if let Some(ref pool) = pool {
                                 log_request(pool.clone(), log_body.clone(), val.clone(), ip, user_agent.clone());
                             }
-                            if let Ok(mut bytes) = serde_json::to_vec(&val) {
-                                bytes.extend(b"\n");
-                                yield Ok::<Bytes, Box<dyn std::error::Error>>(Bytes::from(bytes));
+                            let mut output = Vec::with_capacity(json_str.len() + 10);
+                            output.extend_from_slice(b"data: ");
+                            if let Ok(response_bytes) = serde_json::to_vec(&val) {
+                                output.extend_from_slice(&response_bytes);
+                                output.extend_from_slice(b"\n\n");
+                                yield Ok::<Bytes, Box<dyn std::error::Error>>(Bytes::from(output));
                             }
                         }
                     }
@@ -259,9 +278,9 @@ async fn completions(
 #[get("/models")]
 async fn get_models() -> Result<impl Responder, Box<dyn std::error::Error>> {
     let available_models = get_available_models()
-        .into_iter()
+        .iter()
         .map(|id| ModelObject {
-            id,
+            id: id.clone(),
             object: "model".to_string(),
             created: 1640995200,
             owned_by: "system".to_string(),
@@ -299,6 +318,7 @@ async fn main() -> std::io::Result<()> {
         cfg.manager = Some(ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         });
+        cfg.pool = Some(deadpool_postgres::PoolConfig::new(32));
 
         match cfg.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls) {
             Ok(pool) => {
@@ -314,7 +334,12 @@ async fn main() -> std::io::Result<()> {
                                 ip INET NOT NULL,
                                 user_agent VARCHAR(512),
                                 created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-                            );",
+                            );
+                            CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_created_at ON api_request_logs(created_at);
+                            CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_ip ON api_request_logs(ip);
+                            CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_response_usage ON api_request_logs USING GIN ((response->'usage'));
+                            CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_total_tokens ON api_request_logs(((response->'usage'->>'total_tokens')::INTEGER)) WHERE response ? 'usage' AND response->'usage' ? 'total_tokens';
+                            CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_logs_request_model ON api_request_logs USING GIN ((request->'model'));",
                             )
                             .await;
 
@@ -357,7 +382,16 @@ async fn main() -> std::io::Result<()> {
         token
     });
 
-    let client = Client::builder().default_headers(headers).build().unwrap();
+    let client = Client::builder()
+        .default_headers(headers)
+        .pool_max_idle_per_host(20)
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .use_rustls_tls()
+        .build()
+        .unwrap();
     let app_state = AppState { client, db_pool };
 
     HttpServer::new(move || {
@@ -366,9 +400,11 @@ async fn main() -> std::io::Result<()> {
                 actix_cors::Cors::default()
                     .allow_any_origin()
                     .allow_any_method()
-                    .allow_any_header(),
+                    .allow_any_header()
+                    .max_age(3600),
             )
             .app_data(web::Data::new(app_state.clone()))
+            .app_data(web::JsonConfig::default().limit(1024 * 1024 * 10))
             .service(index)
             .service(completions)
             .service(get_models)
@@ -377,6 +413,9 @@ async fn main() -> std::io::Result<()> {
             .service(hey)
             .wrap(Logger::default())
     })
+    .workers(num_cpus::get())
+    .client_request_timeout(std::time::Duration::from_secs(60))
+    .client_disconnect_timeout(std::time::Duration::from_secs(5))
     .bind(("0.0.0.0", 8080))?
     .run()
     .await
